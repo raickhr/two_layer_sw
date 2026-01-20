@@ -59,8 +59,6 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
 ---
 
 ## 📂 Repository Structure
-
-```text
 .
 ├── run.jl                 # Stand-alone driver script
 └── src/
@@ -100,10 +98,11 @@ The model requires the following Julia packages (automatically installed via `Pk
 
 ### 2. Clone the Repository
 
-```bash
+```text
 git clone https://github.com/<your-username>/TwoLayerSW.jl.git
 cd two_layer_sw
+```
 
 ### #. Run the default config.
-```bash
+```text
 julia run.jl
