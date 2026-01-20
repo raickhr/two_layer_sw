@@ -10,7 +10,7 @@ The model is designed for idealized and process-oriented studies of:
 - Layered ocean dynamics  
 - Idealized air–sea interaction experiments  
 
-The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` provides a stand-alone driver script.
+The core model is implemented as the `TwoLayerSW` Julia module under `src/`, while `run.jl` provides a stand-alone driver script for running simulations.
 
 ---
 
@@ -35,12 +35,12 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
   - Fully GPU-accelerated kernels
 
 - **Barotropic–baroclinic mode splitting**
-  - External (barotropic) mode advanced with subcycling
+  - External (barotropic) mode advanced using subcycling
   - Internal (baroclinic) mode advanced with a larger timestep
-  - Barotropic timestep: `dtBT = dt / M`
+  - Barotropic timestep defined as `dtBT = dt / M`
 
-- **Forcing & dissipation**
-  - Surface wind stress from 10 m wind speed
+- **Forcing and dissipation**
+  - Surface wind stress from prescribed 10-m wind
   - Optional bottom drag
   - Viscous smoothing via parameter `nu`
   - Shapiro filter with strength `smoothing_eps`
@@ -54,11 +54,12 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
 - **NetCDF output**
   - Uses `NCDatasets.jl`
   - Configurable output interval
-  - Standard CF-style variables for post-processing
+  - CF-style variables for post-processing
 
 ---
 
 ## 📂 Repository Structure
+
 ```text
 .
 ├── run.jl                 # Stand-alone driver script
@@ -78,7 +79,7 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
     ├── barotropic.jl      # External-mode time stepping
     ├── baroclinic.jl      # Internal-mode time stepping
     ├── io_netcdf.jl       # NetCDF output utilities
-    └── driver.jl          # High-level run_twoLayer_SW driver
+    └── driver.jl          # High-level `run_twoLayer_SW` driver
 ```
 
 ## 🚀 Running the Model
@@ -86,25 +87,47 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
 ### 1. Requirements
 
 - Julia **≥ 1.10** (recommended)
-- A CUDA-capable GPU
-- CUDA toolkit compatible with `CUDA.jl`
+- A CUDA-capable NVIDIA GPU
+- CUDA toolkit compatible with `CUDA.jl`  
+  *(CUDA.jl can automatically download a suitable toolkit if needed)*
 
-The model requires the following Julia packages (automatically installed via `Pkg.instantiate()`):
+The model depends on the following Julia packages:
+
 - `CUDA`
 - `NCDatasets`
 - `Statistics`
 - `Random`
 - `ProgressMeter`
 
----
+You do **not** need to install these manually.  
+They are installed automatically using Julia’s package manager.
 
 ### 2. Clone the Repository
-
 ```text
 git clone https://github.com/raickhr/two_layer_sw.git
 cd two_layer_sw
 ```
 
-### #. Run the default config.
+### 3. Install Dependencies
+
+Start Julia in project mode:
+```text
+julia --project
+```
+
+Then, inside the Julia REPL, run:
+
+```text
+using Pkg
+Pkg.instantiate()
+```
+
+### 4. Run the Default Configuration
+
+Exit Julia and run the model from the terminal:
+
 ```text
 julia run.jl
+```
+
+The default configuration runs a 5-day Kelvin/Rossby wave test case at the equator and writes output to a NetCDF file (e.g. two_layer_SW.nc), which can be analyzed using Julia, Python (xarray), or MATLAB.

@@ -1,0 +1,17 @@
+name = "TwoLayerSW"
+uuid = "5c31b8eb-0c52-4b33-8f0c-30e7c517c7a7"
+authors = ["Shikhar Rai"]
+version = "0.1.0"
+
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
+Statistics = "10745b16-80b9-5fbc-bc7c-0c5c7d8c4f1b"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
+
+[compat]
+julia = "1.10"
+CUDA = "5"
+NCDatasets = "0.13, 0.14"
+ProgressMeter = "1"
