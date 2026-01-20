@@ -101,7 +101,7 @@ The model requires the following Julia packages (automatically installed via `Pk
 ### 2. Clone the Repository
 
 ```text
-git clone https://github.com/<your-username>/TwoLayerSW.jl.git
+git clone https://github.com/raickhr/two_layer_sw.git
 cd two_layer_sw
 ```
 
