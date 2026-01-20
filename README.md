@@ -59,6 +59,7 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
 ---
 
 ## 📂 Repository Structure
+```text
 .
 ├── run.jl                 # Stand-alone driver script
 └── src/
@@ -78,6 +79,7 @@ The core model lives in the `TwoLayerSW` module under `src/`, while `run.jl` pro
     ├── baroclinic.jl      # Internal-mode time stepping
     ├── io_netcdf.jl       # NetCDF output utilities
     └── driver.jl          # High-level run_twoLayer_SW driver
+```
 
 ## 🚀 Running the Model
 
