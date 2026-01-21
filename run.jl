@@ -49,7 +49,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
         # ------------------------
         dt       = 60.0,          # baroclinic time step (s)
         M        = 120,           # barotropic subcycles
-        end_time = 12 * 24 * 3600.0,   # 2 days
+        end_time = 12 * 24 * 3600.0,   # 12 days
 
         # ------------------------
         # Layer properties
