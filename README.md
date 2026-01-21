@@ -20,9 +20,7 @@ The core model is implemented as the `TwoLayerSW` Julia module under `src/`, whi
   - Upper and lower layer thicknesses $ h_1, h_2 $
   - Free surface height $ \eta $ and interface displacement $ \xi $
   - Reduced gravity
-    $$
-      g' = g \, (\rho_2 - \rho_1)/\rho_2
-    $$
+    $$ g' = g \, (\rho_2 - \rho_1)/\rho_2 $$
 
 - **Arakawa C-grid staggering**
   - Scalars $ h_1, h_2, \eta, \xi $ at cell centers
