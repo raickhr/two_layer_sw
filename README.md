@@ -129,3 +129,13 @@ julia run.jl
 ```
 
 The default configuration runs a 5-day Kelvin/Rossby wave test case at the equator and writes output to a NetCDF file (e.g. two_layer_SW.nc), which can be analyzed using Julia, Python (xarray), or MATLAB.
+
+## 🎥 Model Animation
+
+Click thumbnail to play the MP4:
+
+[![η movie thumbnail](assets/eta_thumb.png)](assets/eta_movie.mp4)
+
+Or view the GIF below:
+
+![η animation](assets/eta_movie.gif)
