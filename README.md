@@ -141,4 +141,6 @@ View the GIF below:
 
 View the GIF below:
 
-![η animation](assets/zeta_movie.mp4)
+<video src="assets/zeta_movie.mp4" controls="controls" style="max-width: 100%;">
+  Your browser does not support the video tag.
+</video>
