@@ -2,6 +2,8 @@
 *.nc
 *.ipynb
 *.gif
+!assets/*.gif
+!assets/*.mp4
 *.log
 *.png
 *.mp4

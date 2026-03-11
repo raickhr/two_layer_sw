@@ -141,4 +141,4 @@ View the GIF below:
 
 View the GIF below:
 
-![η animation](assets/zeta_movie.gif)
+![η animation](assets/zeta_movie.mp4)
