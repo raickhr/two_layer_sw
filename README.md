@@ -135,3 +135,10 @@ The default configuration runs a 12-day Kelvin/Rossby wave test case at the equa
 View the GIF below:
 
 ![η animation](assets/eta_movie.gif)
+
+
+## 🎥 Model Animation Baroclinic Instability Case
+
+View the GIF below:
+
+![η animation](assets/zeta_movie.gif)
