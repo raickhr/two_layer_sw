@@ -1,99 +1,105 @@
 """
 stateVars.jl
 
-Defines the core **State container** for the two-layer rotating shallow-water model
-and allocates all GPU-resident arrays.
-
-This file centralizes *all mutable model fields* so that:
-- No CuArray allocations occur inside time-stepping routines
-- Barotropic and baroclinic solvers reuse shared scratch buffers
-- Memory layout and ownership are explicit and easy to reason about
-
-Assumptions
------------
-- `FT` is the floating-point type (e.g. Float32 or Float64), defined elsewhere
-- `Params` contains at least:
-    * `Nx, Ny :: Int`   : horizontal grid size
-    * `H1, H2 :: Real` : resting layer thicknesses
-- `CUDA` is available in the parent module (`using CUDA`)
+Defines the core GPU-resident State container for the
+two-layer rotating shallow-water model.
 """
-
 
 # ============================================================
 # Prognostic variables (time-stepped state)
 # ============================================================
-"""
-    Prognostic
 
-Holds all **prognostic (time-integrated)** variables of the model.
-
-Grid staggering:
-- Thicknesses (`h*`, `H`) live at **h-points**
-- Zonal transports (`m*`, `M`) live at **u-points**
-- Meridional transports (`n*`, `N`) live at **v-points**
-
-Fields
-------
-Layer thicknesses:
-- `h1(i,j)` : top-layer thickness
-- `h2(i,j)` : bottom-layer thickness
-- `H(i,j)`  : total thickness = h1 + h2
-- `H_old`   : total thickness at previous *baroclinic* time step
-              (used for explicit pressure/forcing splitting)
-
-Zonal mass transports:
-- `m1 = h1 * u1`
-- `m2 = h2 * u2`
-- `M  = H  * U`   (barotropic transport)
-
-Meridional mass transports:
-- `n1 = h1 * v1`
-- `n2 = h2 * v2`
-- `N  = H  * V`
-
-Notes
------
-- All arrays are **mutated in place**
-- Time-level separation is handled algorithmically, not by duplicate storage
-"""
 struct Prognostic
-    h1::CuArray{FT,2}
-    h2::CuArray{FT,2}
-    H::CuArray{FT,2}
-    H_old::CuArray{FT,2}
-
-    m1::CuArray{FT,2}
-    m2::CuArray{FT,2}
-    M::CuArray{FT,2}
-
-    n1::CuArray{FT,2}
-    n2::CuArray{FT,2}
-    N::CuArray{FT,2}
+    h::CuArray{FT,2}   # thickness (HGRID)
+    m::CuArray{FT,2}   # h*u (UGRID)
+    n::CuArray{FT,2}   # h*v (VGRID)
 end
 
 
 # ============================================================
-# External forcing fields
+# Intermediate variables (predictor stage)
 # ============================================================
-"""
-    Forcing
 
-Holds all externally prescribed forcing fields.
+struct Intermediate
+    h_star::CuArray{FT,2}
+    m_star::CuArray{FT,2}
+    n_star::CuArray{FT,2}
+end
 
-Fields
-------
-Atmospheric forcing:
-- `uwind`, `vwind` : 10 m wind velocity components on the model grid
 
-Stress fields:
-- `taux_sf`, `tauy_sf` : surface wind stress
-- `taux_bt`, `tauy_bt` : bottom drag stress
+# ============================================================
+# Diagnostic variables (recomputed every RHS)
+# ============================================================
 
-Notes
------
-- Stresses are computed in `forcing.jl`
-- They are applied in both barotropic and baroclinic solvers
-"""
+struct Diagnostic
+    u::CuArray{FT,2}
+    gradx_u::CuArray{FT,2}
+    grady_u::CuArray{FT,2}
+    v::CuArray{FT,2}
+    gradx_v::CuArray{FT,2}
+    grady_v::CuArray{FT,2}
+    zeta::CuArray{FT,2}
+
+    advec_term_u::CuArray{FT,2}
+    advec_term_v::CuArray{FT,2}
+
+    pressure::CuArray{FT,2}
+    gradx_pres::CuArray{FT,2}
+    grady_pres::CuArray{FT,2}
+
+    viscosity_u::CuArray{FT,2}
+    viscosity_v::CuArray{FT,2}
+    viscous_term_u::CuArray{FT,2}
+    viscous_term_v::CuArray{FT,2}
+
+    advx_curv::CuArray{FT,2}
+    advy_curv::CuArray{FT,2}
+    visx_curv::CuArray{FT,2}
+    visy_curv::CuArray{FT,2}
+
+    coriolis_term_u::CuArray{FT,2}
+    coriolis_term_v::CuArray{FT,2}
+end
+
+
+# ============================================================
+# AB3–AM3 history storage
+# ============================================================
+
+struct History
+    rhs_m_tp1::CuArray{FT,2}
+    rhs_m_tm0::CuArray{FT,2}
+    rhs_m_tm1::CuArray{FT,2}
+    rhs_m_tm2::CuArray{FT,2}
+
+    rhs_n_tp1::CuArray{FT,2}
+    rhs_n_tm0::CuArray{FT,2}
+    rhs_n_tm1::CuArray{FT,2}
+    rhs_n_tm2::CuArray{FT,2}
+
+    rhs_h_tp1::CuArray{FT,2}
+    rhs_h_tm0::CuArray{FT,2}
+    rhs_h_tm1::CuArray{FT,2}
+    rhs_h_tm2::CuArray{FT,2}
+end
+
+
+# ============================================================
+# Shared interpolated variables
+# ============================================================
+
+struct Interpolated
+    h_in_u::CuArray{FT,2}
+    h_in_v::CuArray{FT,2}
+    u_in_v::CuArray{FT,2}
+    v_in_u::CuArray{FT,2}
+end
+
+
+# ============================================================
+# Forcing variables
+# ============================================================
+
 struct Forcing
     uwind::CuArray{FT,2}
     vwind::CuArray{FT,2}
@@ -107,27 +113,9 @@ end
 
 
 # ============================================================
-# Temporary work arrays (scratch space)
+# Scratch space (shared temporary arrays)
 # ============================================================
-"""
-    Temporary
 
-Reusable **scratch arrays** for intermediate computations.
-
-These buffers are intentionally generic and are **aliased differently**
-in different parts of the solver:
-
-- barotropic solver
-- baroclinic solver
-- reconstructions
-- forcing calculations
-
-Design rules
-------------
-- No kernel allocates memory
-- Aliasing is safe because usage phases do not overlap
-- Size is always `(Nx, Ny)`
-"""
 struct Temporary
     temp_var_x1::CuArray{FT,2}
     temp_var_y1::CuArray{FT,2}
@@ -143,39 +131,23 @@ struct Temporary
 
     temp_var_x5::CuArray{FT,2}
     temp_var_y5::CuArray{FT,2}
-
-    temp_var_x6::CuArray{FT,2}
-    temp_var_y6::CuArray{FT,2}
-
-    temp_var_x7::CuArray{FT,2}
-    temp_var_y7::CuArray{FT,2}
-
-    temp_var_x8::CuArray{FT,2}
-    temp_var_y8::CuArray{FT,2}
-
-    temp_var_x9::CuArray{FT,2}
-    temp_var_y9::CuArray{FT,2}
 end
 
 
 # ============================================================
 # Top-level model state
 # ============================================================
-"""
-    State
 
-Top-level container holding **all mutable model state**.
-
-Components
-----------
-- `prog :: Prognostic` : time-evolving physical state
-- `forc :: Forcing`    : externally imposed forcing
-- `temp :: Temporary` : shared scratch space
-
-All time-stepping routines mutate a `State` in place.
-"""
 struct State
-    prog::Prognostic
+    prog1::Prognostic
+    prog2::Prognostic
+    diag1::Diagnostic
+    diag2::Diagnostic
+    hist1::History
+    hist2::History
+    intm1::Intermediate
+    intm2::Intermediate
+    intp::Interpolated
     forc::Forcing
     temp::Temporary
 end
@@ -184,55 +156,38 @@ end
 # ============================================================
 # Allocation routine
 # ============================================================
-"""
-    allocate_state(p::Params) -> State
 
-Allocate and initialize all model fields on the GPU.
-
-Initialization
---------------
-- `h1 = H1`, `h2 = H2`, `H = H1 + H2`
-- All transports set to zero
-- Forcing fields initialized to zero
-- All temporary buffers zeroed
-
-No allocations occur after this call.
-"""
 function allocate_state(p::Params)::State
     Nx, Ny = p.Nx, p.Ny
 
-    # ---------- Prognostic ----------
-    h1 = CUDA.fill(FT(p.H1), Nx, Ny)
-    h2 = CUDA.fill(FT(p.H2), Nx, Ny)
-    H  = CUDA.fill(FT(p.H1 + p.H2), Nx, Ny)
-    H_old = CUDA.fill(FT(p.H1 + p.H2), Nx, Ny)
+    # Prognostic
+    prog1 = Prognostic(
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+    )
 
-    m1 = CUDA.zeros(FT, Nx, Ny)
-    m2 = CUDA.zeros(FT, Nx, Ny)
-    M  = CUDA.zeros(FT, Nx, Ny)
+    prog2 = Prognostic(
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+    )
 
-    n1 = CUDA.zeros(FT, Nx, Ny)
-    n2 = CUDA.zeros(FT, Nx, Ny)
-    N  = CUDA.zeros(FT, Nx, Ny)
+    # Intermediate
+    intm1 = Intermediate(
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+    )
 
-    prog = Prognostic(h1, h2, H, H_old, m1, m2, M, n1, n2, N)
+    intm2 = Intermediate(
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+    )
 
-    # ---------- Forcing ----------
-    uwind = CUDA.zeros(FT, Nx, Ny)
-    vwind = CUDA.zeros(FT, Nx, Ny)
-
-    taux_sf = CUDA.zeros(FT, Nx, Ny)
-    tauy_sf = CUDA.zeros(FT, Nx, Ny)
-    taux_bt = CUDA.zeros(FT, Nx, Ny)
-    tauy_bt = CUDA.zeros(FT, Nx, Ny)
-
-    forc = Forcing(uwind, vwind, taux_sf, tauy_sf, taux_bt, tauy_bt)
-
-    # ---------- Temporary ----------
-    temp = Temporary(
-        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
-        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
-        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    # History
+    hist1 = History(
         CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
         CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
         CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
@@ -241,5 +196,67 @@ function allocate_state(p::Params)::State
         CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
     )
 
-    return State(prog, forc, temp)
+    hist2 = History(
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    )
+
+    # Interpolated
+    intp = Interpolated(
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny),
+    )
+
+    # Diagnostic
+    diag1 = Diagnostic(
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    )
+
+    diag2 = Diagnostic(
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    )
+
+    # Forcing
+    forc = Forcing(
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    )
+
+    # Temporary
+    temp = Temporary(
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+        CUDA.zeros(FT, Nx, Ny), CUDA.zeros(FT, Nx, Ny),
+    )
+
+    return State(
+        prog1, prog2,
+        diag1, diag2,
+        hist1, hist2,
+        intm1, intm2,
+        intp, forc, temp,
+    )
 end

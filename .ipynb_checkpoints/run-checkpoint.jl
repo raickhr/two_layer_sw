@@ -33,37 +33,85 @@ using TwoLayerSW
 # ----------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
 
+    # TwoLayerSW.run_twoLayer_SW(
+    #     # ------------------------
+    #     # Grid & domain
+    #     # ------------------------
+    #     Nx   = 128,
+    #     Ny   = 64,
+    #     lon1 = -220.0,
+    #     lat1 = -20.0,
+    #     lon2 = -140.0,
+    #     lat2 = 20.0,
+
+    #     # ------------------------
+    #     # Time stepping
+    #     # ------------------------
+    #     dt       = 5,          # baroclinic time step (s)
+    #     M        = 0,           # barotropic subcycles
+    #     end_time = 20 * 24 * 3600.0,   # 12 days
+
+    #     # ------------------------
+    #     # Layer properties
+    #     # ------------------------
+    #     H1   = 200.0,
+    #     H2   = 3800.0,
+    #     rho1 = 1025.0,
+    #     rho2 = 1027.0,
+
+    #     # ------------------------
+    #     # Forcing parameters
+    #     # ------------------------
+    #     rho_air = 1.2,
+    #     u10     = 10.0,
+    #     v10     = 0.0,
+    #     Cd1     = 0.0,
+    #     Cd2     = 0.0,
+
+    #     # ------------------------
+    #     # Dissipation / smoothing
+    #     # ------------------------
+    #     nu            = 1,
+    #     smoothing_eps = 1e-6,
+
+    #     # ------------------------
+    #     # Output
+    #     # ------------------------
+    #     save_interval = 3*3600, # 1 hours
+    #     out_netcdf    = "two_layer_SW.nc",
+    # )
+
     TwoLayerSW.run_twoLayer_SW(
         # ------------------------
         # Grid & domain
         # ------------------------
-        Nx   = 128,
-        Ny   = 64,
-        lon1 = -220.0,
-        lat1 = -20.0,
-        lon2 = -140.0,
-        lat2 = 20.0,
+        Nx   = 256,
+        Ny   = 256,
+        lon1 = -190.0,
+        lat1 = 55.5,
+        lon2 = -175.0,
+        lat2 = 63.0,
 
         # ------------------------
         # Time stepping
         # ------------------------
-        dt       = 60.0,          # baroclinic time step (s)
-        M        = 120,           # barotropic subcycles
-        end_time = 12 * 24 * 3600.0,   # 2 days
+        dt       = 1,          # baroclinic time step (s)
+        M        = 0,           # barotropic subcycles
+        end_time = 60*24*3600.0,   # 12 days
 
         # ------------------------
         # Layer properties
         # ------------------------
-        H1   = 200.0,
-        H2   = 3800.0,
+        H1   = 500.0,
+        H2   = 1500.0,
         rho1 = 1025.0,
-        rho2 = 1027.0,
+        rho2 = 1026.0,
 
         # ------------------------
         # Forcing parameters
         # ------------------------
         rho_air = 1.2,
-        u10     = 10.0,
+        u10     = 1.0,
         v10     = 0.0,
         Cd1     = 0.0,
         Cd2     = 0.0,
@@ -71,14 +119,15 @@ if abspath(PROGRAM_FILE) == @__FILE__
         # ------------------------
         # Dissipation / smoothing
         # ------------------------
-        nu            = 10,
-        smoothing_eps = 0.05,
+        nu            = 0.1, #200,
+        smoothing_eps = 0.001,
 
         # ------------------------
         # Output
         # ------------------------
         save_interval = 3*3600, # 1 hours
-        out_netcdf    = "two_layer_SW.nc",
+        out_netcdf    = "two_layer_SW_bc_inst.nc",
+        diag_netcdf   = "diag.nc", #"diag.nc",
     )
 
 end

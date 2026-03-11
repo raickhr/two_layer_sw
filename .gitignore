@@ -1,2 +1,7 @@
 **/*.nc
 *.nc
+*.ipynb
+*.gif
+*.log
+*.png
+*.mp4

@@ -14,8 +14,8 @@ function k_apply_shapiro_filter!(
         im1 = iper(i-1, Nx)
         ip1 = iper(i+1, Nx)
 
-        jm1 = clamp1(j-1, Ny)
-        jp1 = clamp1(j+1, Ny)
+        jm1 = clamp1toN(j-1, Ny)
+        jp1 = clamp1toN(j+1, Ny)
 
         center = H_star[i,j]
         neigh_sum = H_star[im1,j] + H_star[ip1,j] +

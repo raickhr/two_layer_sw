@@ -40,6 +40,11 @@ using ProgressMeter
 CUDA.allowscalar(false)
 
 const FT = Float32
+const GRID0 = Int16(0)
+const HGRID = Int16(1)
+const UGRID = Int16(2)
+const VGRID = Int16(3)
+const ZGRID = Int16(4)
 
 # Core configuration & state
 include("params.jl")

@@ -150,7 +150,7 @@ function make_params(; kwargs...)
     # ------------------------------------------------------------
     dlon = (kw.lon2 - kw.lon1) / (kw.Nx - 1)
     dlat = (kw.lat2 - kw.lat1) / (kw.Ny - 1)
-    gp   = kw.g * (kw.rho2 - kw.rho1) / kw.rho2
+    gp   = kw.g * (kw.rho2 - kw.rho1) / kw.rho1
     dtBT = kw.dt / kw.M
 
     # ------------------------------------------------------------

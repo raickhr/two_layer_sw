@@ -1,742 +1,587 @@
+############################################################
 # baroclinic.jl
 #
-# Routines for advancing the **baroclinic (internal) modes** of the 2-layer
-# rotating shallow-water system on a C-grid.
+# Baroclinic (internal-mode) time stepping for a two-layer
+# rotating shallow-water model on a C-grid.
 #
-# Time stepping:
-#   - Explicit RK4 (4th-order Runge–Kutta) for **non-Coriolis** terms:
-#       * baroclinic pressure / form drag
-#       * curvature / metric terms
-#       * surface & bottom stress splitting
-#       * biharmonic viscosity (∝ ∇⁴) on (m, n)
-#       * advective transport of (m, n) and h (WENO-Z, flux form)
-#   - Semi-implicit Coriolis update with existing `k_add_coriolisforce!`
-#   - Shapiro filter on h (10x weaker than barotropic)
+# This module advances the slow internal modes:
+#   - Layer 1: (m1, n1, h1)
+#   - Layer 2: (m2, n2, h2)
 #
-# No CuArray allocations occur here; all scratch space is taken from
-# `state.temp::Temporary`.
+# using a ROMS-style AB3–AM3 predictor–corrector scheme:
 #
-# Main entry points
-# -----------------
-# - `step_baroclinic_layer!(...)` : RK4 step for a single layer (1 or 2)
-# - `step_baroclinic!(...)`       : convenience wrapper (layer 1 then layer 2)
+#   1. Predictor (AB3, explicit):
+#        q^{n+1,pre} = q^n
+#                      + Δt [ 23/12 R(q^n)
+#                              −16/12 R(q^{n−1})
+#                               5/12 R(q^{n−2}) ]
+#
+#   2. Corrector (AM3, implicit in the tendencies):
+#        q^{n+1} = q^n
+#                  + Δt [  5/12 R(q^{n+1,pre})
+#                          8/12 R(q^n)
+#                         −1/12 R(q^{n−1}) ]
+#
+# where q stands for (m, n, h) for each layer.
+#
+# prog::Prognostic holds the state at time n and is updated
+# in-place to time n+1.
+#
+# hist::History stores tendency histories:
+#   rhs_*_tm0 ≈ R(q^n)
+#   rhs_*_tm1 ≈ R(q^{n−1})
+#   rhs_*_tm2 ≈ R(q^{n−2})
+#   rhs_*_tp1 ≈ R(q^{n+1,pre})
+#
+# intm::Intermediate holds provisional AB3-predicted fields:
+#   h1_star, h2_star
+#   m1_star, m2_star
+#   n1_star, n2_star
+############################################################
 
-
-# ============================================================
-# Non-Coriolis baroclinic RHS
-# ============================================================
-
-"""
-    compute_baroclinic_rhs_nonCoriolis!(
-        k_m, k_n, k_h,
-        m_state, n_state, h_state,
-        state, grid, p, layer,
-        threads1, blocks1, threads2, blocks2;
-        h_in_u, h_in_v, buf_x, buf_y, termx, termy, u_face, v_face,
-        mode_split,
-    )
-
-Compute **non-Coriolis** baroclinic tendencies for a given stage state
-`(m_state, n_state, h_state)` of a single layer:
-
-    k_m = (form drag + baroclinic PGF + curvature + forcing
-           + biharmonic viscosity + advection of m_state)
-
-    k_n = same for meridional transport
-
-    k_h = (-∇·(u h_state))
-
-All arguments are CuArray{FT,2} with size (Nx,Ny).
-
-This routine does **not** apply Coriolis or Shapiro filtering; those are
-handled around the RK4 driver.
-"""
-function compute_baroclinic_rhs_nonCoriolis!(
-    k_m, k_n, k_h,
-    m_state, n_state, h_state,
-    state::State,
-    grid::Grid,
-    p::Params,
-    layer::Int,
+function calc_pressure_all!(
+    p1, p2, h1, h2,
+    g::FT,
+    rho1::FT,
+    rho2::FT,
     threads1::Int,
     blocks1::Int,
-    threads2::NTuple{2,Int},
-    blocks2::NTuple{2,Int};
-    h_in_u,
-    h_in_v,
-    buf_x,
-    buf_y,
-    termx,
-    termy,
-    u_face,
-    v_face,
-    mode_split::Bool,
+    Nx::Int,
+    Ny::Int,
 )
-    Nx, Ny = p.Nx, p.Ny
+    #gp = (rho2 - rho1)/rho1 * g
 
-    # -------------------------
-    # Grid metrics
-    # -------------------------
-    dx_n2n_h  = grid.dx_n2n_h
-    dy_n2n_h  = grid.dy_n2n_h
-    dx_face_h = grid.dx_face_h
-    dy_face_h = grid.dy_face_h
-    dArea_h   = grid.dArea_h
+    @. p1 = g * (h1 + h2)
+    @. p2 = g * h1 + rho2/rho1 * g * h2
 
-    dx_n2n_u  = grid.dx_n2n_u
-    dy_n2n_u  = grid.dy_n2n_u
-    dx_face_u = grid.dx_face_u
-    dy_face_u = grid.dy_face_u
-    dArea_u   = grid.dArea_u
+    # this is not full pressure. This is just the coupling pressure
+    # for layer 1
+    #       1/ρ * h1∇p = gh1∇(h1+ h2)   
+    #                  = ∇(1/2 g h1²) + gh1∇h2 
+    # First part goes into advective term. The second part is coupling part.
+    # @. p1 = g * h2
+    # @. p2 = rho1/rho2 * g * h1
 
-    dx_n2n_v  = grid.dx_n2n_v
-    dy_n2n_v  = grid.dy_n2n_v
-    dx_face_v = grid.dx_face_v
-    dy_face_v = grid.dy_face_v
-    dArea_v   = grid.dArea_v
-
-    lat_u     = grid.lat_u
-    lat_v     = grid.lat_v
-
-    # -------------------------
-    # Scalars
-    # -------------------------
-    g      = FT(p.g)
-    gp     = FT(p.gp)
-    ρ1     = FT(p.rho1)
-    ρ2     = FT(p.rho2)
-    hmin   = FT(p.hmin)
-    ν      = FT(p.nu)
-    Rearth = FT(p.earthRadius)
-
-    # -------------------------
-    # Aliases to prognostic / forcing
-    # -------------------------
-    prog   = state.prog
-    forc   = state.forc
-
-    h1     = prog.h1
-    h2     = prog.h2
-    H_old  = prog.H_old
-
-    taux_sf = forc.taux_sf
-    tauy_sf = forc.tauy_sf
-    taux_bt = forc.taux_bt
-    tauy_bt = forc.tauy_bt
-
-    # Scratch aliases
-    h1_in_u = buf_x   # first use of buf_x / buf_y: h1 reconstructions
-    h1_in_v = buf_y
-
-    # Ensure tendencies start from zero
-    @. k_m = FT(0)
-    @. k_n = FT(0)
-    @. k_h = FT(0)
-
-    # ========================================================
-    # 1. Wall BCs for meridional transport (no-normal flow)
-    # ========================================================
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(n_state, Nx, Ny)
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(h1, Nx, Ny)
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(h_state, Nx, Ny)
-
-    # ========================================================
-    # 2. Reconstructions: h₁ at u/v, active layer h at u/v
-    # ========================================================
-    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_u!(h1_in_u, h1, Nx, Ny, hmin)
-    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_v!(h1_in_v, h1, Nx, Ny, hmin)
-
-    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_u!(h_in_u, h_state, Nx, Ny, hmin)
-    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_v!(h_in_v, h_state, Nx, Ny, hmin)
-
-    # ========================================================
-    # 3. Form drag / baroclinic pressure gradient
-    #    based on ∇h₂ and layer-dependent coefficients.
-    # ========================================================
-
-    # termx, termy: ∂h₂/∂x, ∂h₂/∂y at h-points
-    @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-        termx, termy,
-        h2,
-        dx_n2n_h, dy_n2n_h,
-        Nx, Ny
-    )
-
-    if layer == 1
-        # + g * h₁ ∇h₂
-        @. termx = termx * (g * h1_in_u)
-        @. termy = termy * (g * h1_in_v)
-    else
-        # (- g h₁ - g' h₂) ∇h₂
-        @. termx = termx * (-g * h1_in_u - gp * h_in_u)
-        @. termy = termy * (-g * h1_in_v - gp * h_in_v)
-    end
-
-    # Always add baroclinic contribution
-    @. k_m = k_m + termx
-    @. k_n = k_n + termy
-    
-    # If not splitting, also include barotropic PGF from total thickness H
-    if !mode_split
-        @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-            termx, termy,
-            prog.H,              # total thickness at h-points
-            dx_n2n_h, dy_n2n_h,
-            Nx, Ny
-        )
-
-        # add g h ∇H term
-        @. termx = (g * h_in_u) * termx
-        @. termy = (g * h_in_v) * termy
-
-        @. k_m = k_m + termx
-        @. k_n = k_n + termy
-    end
-
-    # ========================================================
-    # 4. Curvature / metric terms
-    # ========================================================
-    @cuda threads=threads2 blocks=blocks2 k_calc_curvature_terms!(
-        termx, termy,
-        m_state, n_state,
-        h_in_u, h_in_v,
-        lat_u, lat_v,
-        Nx, Ny,
-        Rearth
-    )
-
-    @. k_m = k_m + termx
-    @. k_n = k_n + termy
-
-    # ========================================================
-    # 5. Baroclinic forcing split using H_old
-    # ========================================================
-
-    if mode_split
-        H_in_u = buf_x   # reuse buf_x / buf_y
-        H_in_v = buf_y
-
-        @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(H_old, Nx, Ny)        
-        @cuda threads=threads2 blocks=blocks2 k_recon_h_in_u!(H_in_u, H_old, Nx, Ny, hmin)
-        @cuda threads=threads2 blocks=blocks2 k_recon_h_in_v!(H_in_v, H_old, Nx, Ny, hmin)
-
-        if layer == 1
-            @. termx = taux_sf/ρ1 - (h_in_u / H_in_u) * (taux_sf/ρ1 + taux_bt/ρ2)
-            @. termy = tauy_sf/ρ1 - (h_in_v / H_in_v) * (tauy_sf/ρ1 + tauy_bt/ρ2)
-        else
-            @. termx = taux_bt/ρ2 - (h_in_u / H_in_u) * (taux_sf/ρ1 + taux_bt/ρ2)
-            @. termy = tauy_bt/ρ2 - (h_in_v / H_in_v) * (tauy_sf/ρ1 + tauy_bt/ρ2)
-        end
-    else
-        if layer == 1
-            @. termx = taux_sf/ρ1
-            @. termy = tauy_sf/ρ1
-        else
-            @. termx = taux_bt/ρ2 
-            @. termy = tauy_bt/ρ2
-        end
-    end
-
-    @. k_m = k_m + termx
-    @. k_n = k_n + termy
-
-    # ========================================================
-    # 6. Viscosity: biharmonic on transports (m_state, n_state)
-    #    We interpret p.nu as sqrt(A4), so:
-    #      L(q)   = ∇·(ν ∇q)  ≈ ν ∇² q
-    #      L(L(q)) ≈ ν² ∇⁴ q
-    #    Add dissipative term:  -ν² ∇⁴ q
-    # ========================================================
-    gradx = buf_x  # reuse buf_x / buf_y as gradient buffers
-    grady = buf_y
-
-    # For m_state (u-grid)
-    @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-        gradx, grady,
-        m_state,
-        dx_n2n_u, dy_n2n_u,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_laplacian!(
-        termx, gradx, grady,
-        dx_face_u, dy_face_u,
-        dArea_u,
-        ν,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-        gradx, grady,
-        termx,
-        dx_n2n_u, dy_n2n_u,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_laplacian!(
-        termx, gradx, grady,
-        dx_face_u, dy_face_u,
-        dArea_u,
-        ν,
-        Nx, Ny
-    )
-
-    @. k_m = k_m - termx
-
-    # For n_state (v-grid)
-    @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-        gradx, grady,
-        n_state,
-        dx_n2n_v, dy_n2n_v,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_laplacian!(
-        termy, gradx, grady,
-        dx_face_v, dy_face_v,
-        dArea_v,
-        ν,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_gradient!(
-        gradx, grady,
-        termy,
-        dx_n2n_v, dy_n2n_v,
-        Nx, Ny
-    )
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_laplacian!(
-        termy, gradx, grady,
-        dx_face_v, dy_face_v,
-        dArea_v,
-        ν,
-        Nx, Ny
-    )
-
-    @. k_n = k_n - termy
-
-    # ========================================================
-    # 7. Advective transport of (m_state, n_state)
-    #    WENO-Z, flux-form, on u- and v-cells.
-    # ========================================================
-    u_face_for_u = u_face
-    v_face_for_u = v_face
-
-    # u-cells (advecting m_state)
-    @cuda threads=threads2 blocks=blocks2 k_calc_faceVels_for_ucell!(
-        u_face_for_u, v_face_for_u,
-        m_state, n_state,
-        h_state,
-        Nx, Ny,
-        hmin
-    )
-
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(v_face_for_u, Nx, Ny)
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_WENOZ_flux2d!(
-        termx,
-        m_state,
-        u_face_for_u, v_face_for_u,
-        dx_face_u, dy_face_u,
-        dArea_u,
-        Nx, Ny
-    )
-
-    @. k_m = k_m + termx
-
-    # v-cells (advecting n_state)
-    u_face_for_v = u_face
-    v_face_for_v = v_face
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_faceVels_for_vcell!(
-        u_face_for_v, v_face_for_v,
-        m_state, n_state,
-        h_state,
-        Nx, Ny,
-        hmin
-    )
-
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(v_face_for_v, Nx, Ny)
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_WENOZ_flux2d!(
-        termy,
-        n_state,
-        u_face_for_v, v_face_for_v,
-        dx_face_v, dy_face_v,
-        dArea_v,
-        Nx, Ny
-    )
-
-    @. k_n = k_n + termy
-
-    # ========================================================
-    # 8. Mass equation: thickness advection of h_state
-    #    k_h = ( -∇·(u h_state) )
-    # ========================================================
-    # Reuse u_face, v_face as h-cell face velocities
-    @. u_face = m_state / h_in_u
-    @. v_face = n_state / h_in_v
-
-    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(v_face, Nx, Ny)
-
-    @cuda threads=threads2 blocks=blocks2 k_calc_WENOZ_flux2d!(
-        k_h,
-        h_state,
-        u_face, v_face,
-        dx_face_h, dy_face_h,
-        dArea_h,
-        Nx, Ny
-    )
-
-    # k_h already holds (-∇·(u h))
     return nothing
 end
 
 
-# ============================================================
-# Single RK4 baroclinic step for one layer
-# ============================================================
-
-"""
-    rk4_step_baroclinic_layer_once!(
-        state::State,
-        grid::Grid,
-        p::Params,
-        dt::FT,
-        layer::Int;
-        threads1, blocks1, threads2, blocks2,
-    )
-
-Perform one RK4 time step of size `dt` for baroclinic variables
-(m_layer, n_layer, h_layer) of the specified `layer` (1 or 2):
-
-- Uses `compute_baroclinic_rhs_nonCoriolis!` for all non-Coriolis terms.
-- Applies one semi-implicit Coriolis update via `k_add_coriolisforce!`.
-- Applies a weak Shapiro filter to h (0.1 × p.smoothing_eps).
-
-Results are written back into:
-- `prog.m1, prog.n1, prog.h1` for `layer == 1`
-- `prog.m2, prog.n2, prog.h2` for `layer == 2`
-"""
-function rk4_step_baroclinic_layer_once!(
-    state::State,
+function compute_baroclinic_rhs!(
+    rhs_m::CuArray{FT,2},
+    rhs_n::CuArray{FT,2},
+    rhs_h::CuArray{FT,2},
+    m::CuArray{FT,2},
+    n::CuArray{FT,2},
+    h::CuArray{FT,2},
+    diag::Diagnostic,
+    temp::Temporary,
+    intp::Interpolated,
     grid::Grid,
-    p::Params,
-    dt::FT,
-    layer::Int;
+    params::Params,
     threads1::Int,
     blocks1::Int,
     threads2::NTuple{2,Int},
     blocks2::NTuple{2,Int},
-    mode_split::Bool,
 )
-    Nx, Ny = p.Nx, p.Ny
+    Nx = Int(params.Nx)
+    Ny = Int(params.Ny)
 
-    prog = state.prog
+    hmin = FT(params.hmin)
+    deg2rad = FT(π) / FT(180)
 
-    # Select layer prognostics
-    m = (layer == 1) ? prog.m1 : prog.m2
-    n = (layer == 1) ? prog.n1 : prog.n2
-    h = (layer == 1) ? prog.h1 : prog.h2
+    # Zero RHS before accumulation
+    @. rhs_m = 0
+    @. rhs_n = 0
+    @. rhs_h = 0
+    
 
-    # Scalars
-    Ω        = FT(p.Ω)
-    smoothϵ  = FT(p.smoothing_eps) * FT(0.1)  # weaker for baroclinic
-    lat_u    = grid.lat_u
-    lat_v    = grid.lat_v
+    ####################################################################
+    #    Diagnostic and intermediate terms used multiple times
+    ####################################################################
 
-    # RK4 weights
-    dt_sixth = dt / FT(6)
-    dt_third = dt / FT(3)
-    dt_half  = dt / FT(2)
+    # Interpolated layer thickness on u/v points
+    h_in_u = intp.h_in_u
+    h_in_v = intp.h_in_v
 
-    temp = state.temp
+    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_u!(h_in_u, h, Nx, Ny)
+    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_v!(h_in_v, h, Nx, Ny)
 
-    # --------------------------------------------------------
-    # Alias Temporary arrays for RK4 and scratch (no allocs)
-    # --------------------------------------------------------
+    # Enforce thickness floor before dividing
+    @. h_in_u = max(h_in_u, hmin)
+    @. h_in_v = max(h_in_v, hmin)
 
-    # Accumulators: q_accum = q_n + Σ(weights * k)
-    m_accum = temp.temp_var_x1
-    n_accum = temp.temp_var_y1
-    h_accum = temp.temp_var_x2
 
-    # Stage states
-    m_stage = temp.temp_var_y2
-    n_stage = temp.temp_var_x3
-    h_stage = temp.temp_var_y3
+    # Velocities on u/v points
+    u = diag.u
+    v = diag.v
 
-    # Current stage tendencies
-    k_m = temp.temp_var_x4
-    k_n = temp.temp_var_y4
-    k_h = temp.temp_var_x5
+    @. u = m / h_in_u
+    @. v = n / h_in_v
 
-    # Scratch for RHS
-    h_in_u = temp.temp_var_x6
-    h_in_v = temp.temp_var_y5
-    buf_x  = temp.temp_var_x7
-    buf_y  = temp.temp_var_y6
-    termx  = temp.temp_var_x8
-    termy  = temp.temp_var_y7
-    u_face = temp.temp_var_x9
-    v_face = temp.temp_var_y8
-    # temp.temp_var_y9 remains free if needed later
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_u!(u, Nx, Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(v, Nx, Ny)
+    
+    @. m = u * h_in_u
+    @. n = v * h_in_v
 
-    # -------------------------
-    # Initialize accumulators
-    # -------------------------
-    @. m_accum = m
-    @. n_accum = n
-    @. h_accum = h
+    # Cross-grid velocities
+    u_in_v = intp.u_in_v
+    v_in_u = intp.v_in_u
 
-    # ========================================================
-    # Stage 1: k1 = f(q_n)
-    # ========================================================
-    @. m_stage = m
-    @. n_stage = n
-    @. h_stage = h
+    @cuda threads=threads2 blocks=blocks2 k_recon_u_in_v!(u_in_v, u, Nx, Ny)
+    @cuda threads=threads2 blocks=blocks2 k_recon_v_in_u!(v_in_u, v, Nx, Ny)
 
-    compute_baroclinic_rhs_nonCoriolis!(
-        k_m, k_n, k_h,
-        m_stage, n_stage, h_stage,
-        state, grid, p, layer,
-        threads1, blocks1, threads2, blocks2;
-        h_in_u=h_in_u,
-        h_in_v=h_in_v,
-        buf_x=buf_x,
-        buf_y=buf_y,
-        termx=termx,
-        termy=termy,
-        u_face=u_face,
-        v_face=v_face,
-        mode_split=mode_split,
-    )
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_u_half!(u_in_v, Nx, Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v_half!(v_in_u, Nx, Ny)
 
-    # Accumulate dt/6 * k1
-    @. m_accum = m_accum + dt_sixth * k_m
-    @. n_accum = n_accum + dt_sixth * k_n
-    @. h_accum = h_accum + dt_sixth * k_h
+    # ∇u and ∇v
+    gradx_u = diag.gradx_u # HGRID
+    grady_u = diag.grady_u # ZGRID
 
-    # Stage state for k2: q_stage = q_n + dt/2 * k1
-    @. m_stage = m + dt_half * k_m
-    @. n_stage = n + dt_half * k_n
-    @. h_stage = h + dt_half * k_h
-
-    # ========================================================
-    # Stage 2: k2 = f(q_n + dt/2 * k1)
-    # ========================================================
-    compute_baroclinic_rhs_nonCoriolis!(
-        k_m, k_n, k_h,
-        m_stage, n_stage, h_stage,
-        state, grid, p, layer,
-        threads1, blocks1, threads2, blocks2;
-        h_in_u=h_in_u,
-        h_in_v=h_in_v,
-        buf_x=buf_x,
-        buf_y=buf_y,
-        termx=termx,
-        termy=termy,
-        u_face=u_face,
-        v_face=v_face,
-        mode_split=mode_split,
-    )
-
-    # Accumulate dt/3 * k2
-    @. m_accum = m_accum + dt_third * k_m
-    @. n_accum = n_accum + dt_third * k_n
-    @. h_accum = h_accum + dt_third * k_h
-
-    # Stage state for k3: q_stage = q_n + dt/2 * k2
-    @. m_stage = m + dt_half * k_m
-    @. n_stage = n + dt_half * k_n
-    @. h_stage = h + dt_half * k_h
-
-    # ========================================================
-    # Stage 3: k3 = f(q_n + dt/2 * k2)
-    # ========================================================
-    compute_baroclinic_rhs_nonCoriolis!(
-        k_m, k_n, k_h,
-        m_stage, n_stage, h_stage,
-        state, grid, p, layer,
-        threads1, blocks1, threads2, blocks2;
-        h_in_u=h_in_u,
-        h_in_v=h_in_v,
-        buf_x=buf_x,
-        buf_y=buf_y,
-        termx=termx,
-        termy=termy,
-        u_face=u_face,
-        v_face=v_face,
-        mode_split=mode_split,
-    )
-
-    # Accumulate dt/3 * k3
-    @. m_accum = m_accum + dt_third * k_m
-    @. n_accum = n_accum + dt_third * k_n
-    @. h_accum = h_accum + dt_third * k_h
-
-    # Stage state for k4: q_stage = q_n + dt * k3
-    @. m_stage = m + dt * k_m
-    @. n_stage = n + dt * k_n
-    @. h_stage = h + dt * k_h
-
-    # ========================================================
-    # Stage 4: k4 = f(q_n + dt * k3)
-    # ========================================================
-    compute_baroclinic_rhs_nonCoriolis!(
-        k_m, k_n, k_h,
-        m_stage, n_stage, h_stage,
-        state, grid, p, layer,
-        threads1, blocks1, threads2, blocks2;
-        h_in_u=h_in_u,
-        h_in_v=h_in_v,
-        buf_x=buf_x,
-        buf_y=buf_y,
-        termx=termx,
-        termy=termy,
-        u_face=u_face,
-        v_face=v_face,
-        mode_split=mode_split,
-    )
-
-    # Accumulate dt/6 * k4
-    @. m_accum = m_accum + dt_sixth * k_m
-    @. n_accum = n_accum + dt_sixth * k_n
-    @. h_accum = h_accum + dt_sixth * k_h
-
-    # -------------------------
-    # Write back explicit RK4 result
-    # -------------------------
-    m .= m_accum
-    n .= n_accum
-    h .= h_accum
-
-    # ========================================================
-    # Semi-implicit Coriolis + Shapiro filter on h
-    # ========================================================
-    # Reuse some temp arrays for Coriolis / Shapiro:
-    m_old  = k_m          # temp_var_x4
-    n_old  = k_n          # temp_var_y4
-    h_star = k_h          # temp_var_x5
-
-    # Copy current m,n into m_old,n_old
-    m_old .= m
-    n_old .= n
-
-    # Use m_stage, n_stage as "m_star, n_star" inputs
-    m_star = m_stage     # temp_var_y2
-    n_star = n_stage     # temp_var_x3
-
-    m_star .= m
-    n_star .= n
-
-    @cuda threads=threads2 blocks=blocks2 k_add_coriolisforce!(
-        m, n,
-        m_old, n_old,
-        m_star, n_star,
-        lat_u, lat_v,
+    @cuda threads=threads2 blocks=blocks2 k_calc_gradient_u!(
+        gradx_u, grady_u, u,
+        grid.dx_n2n_u,
+        grid.dy_n2n_u,
         Nx, Ny,
-        dt, Ω
     )
 
-    # Shapiro smoothing on thickness h
-    h_star .= h
+    gradx_v = diag.gradx_v # ZGRID
+    grady_v = diag.grady_v # HGRID
 
-    @cuda threads=threads2 blocks=blocks2 k_apply_shapiro_filter!(
+    @cuda threads=threads2 blocks=blocks2 k_calc_gradient_v!(
+        gradx_v, grady_v, v,
+        grid.dx_n2n_v, grid.dy_n2n_v,
+        Nx, Ny,
+    )
+
+    # Relative vorticity ζ on ZGRID
+    zeta = diag.zeta
+    @. zeta = gradx_v - grady_u  # ζ = ∂v/∂x - ∂u/∂y
+
+    # Leith viscosity (currently constant ν = params.nu)
+    viscosity_in_u = diag.viscosity_u
+    viscosity_in_v = diag.viscosity_v
+
+    # If/when you restore Leith: call calculate_leith_viscosity! here.
+    calculate_leith_viscosity!(viscosity_in_u, viscosity_in_v, zeta,
+                            grid.dx_n2n_z, grid.dy_n2n_z, 
+                            grid.dx_n2n_u, grid.dy_n2n_u, 
+                            grid.dx_n2n_v, grid.dy_n2n_v,
+                            temp.temp_var_x1, temp.temp_var_y1, 
+                            temp.temp_var_x2, temp.temp_var_y2, 
+                            params.nu, threads2, blocks2, Nx, Ny)
+
+    # @. viscosity_in_u = params.nu
+    # @. viscosity_in_v = params.nu
+
+    ##########################################################
+    #                  MOMENTUM CONSERVATION
+    ##########################################################
+
+    # ========================================================
+    # 1. Pressure Gradient
+    # ========================================================
+    press_gradx = diag.gradx_pres
+    press_grady = diag.grady_pres
+    pressure    = diag.pressure
+
+    dx_n2n_h = grid.dx_n2n_h
+    dy_n2n_h = grid.dy_n2n_h
+
+    @cuda threads=threads2 blocks=blocks2 k_calc_gradient_h!(
+        press_gradx, press_grady,
+        pressure,
+        dx_n2n_h, dy_n2n_h,
+        Nx, Ny,
+    )
+
+    @. rhs_m = rhs_m - press_gradx * h_in_u #1/ρ is alrealy taken care of in pressure calculation
+    @. rhs_n = rhs_n - press_grady * h_in_v
+
+    # ========================================================
+    # 2. Viscous term (Laplacian/Leith + metric curvature)
+    # ========================================================
+    viscous_m = diag.viscous_term_u
+    viscous_n = diag.viscous_term_v
+
+    calculate_viscous_term!(
+        viscous_m, viscous_n,
+        viscosity_in_u, viscosity_in_v,
         h,
-        h_star,
-        smoothϵ,
-        Nx, Ny
+        gradx_u, grady_u,
+        gradx_v, grady_v,
+        grid.dx_face_u, grid.dy_face_u, grid.dArea_u,
+        grid.dx_face_v, grid.dy_face_v, grid.dArea_v,
+        threads2, blocks2,
+        Nx, Ny;
+        hmin = hmin,
+    )
+
+    curv_visc_m = diag.visx_curv
+    curv_visc_n = diag.visy_curv
+
+    gradx_v_in_u = temp.temp_var_x1
+    gradx_u_in_v = temp.temp_var_y1
+
+    # gradx_v is on ZGRID → interpolate to UGRID
+    @cuda threads=threads2 blocks=blocks2 k_recon_z_in_u!(
+        gradx_v_in_u, gradx_v, Nx, Ny,
+    )
+
+    # gradx_u is on HGRID → interpolate to VGRID
+    @cuda threads=threads2 blocks=blocks2 k_recon_h_in_v!(
+        gradx_u_in_v, gradx_u, Nx, Ny,
+    )
+
+    @. curv_visc_m =  viscosity_in_u * h_in_u *
+                      (-FT(2) * tan(grid.lat_u_2d * deg2rad) * gradx_v_in_u / params.earthRadius - 
+                      u/(params.earthRadius^2 * cos(grid.lat_u_2d * deg2rad)))
+
+    @. curv_visc_n = viscosity_in_v * h_in_v *
+                     (FT(2) * tan(grid.lat_v_2d * deg2rad) * gradx_u_in_v / params.earthRadius - 
+                      v/(params.earthRadius^2 * cos(grid.lat_v_2d * deg2rad)))
+
+    @. rhs_m = rhs_m + viscous_m + curv_visc_m
+    @. rhs_n = rhs_n + viscous_n + curv_visc_n
+
+    # ========================================================
+    # 3. Coriolis Terms
+    # ========================================================
+    cor_x = diag.coriolis_term_u
+    cor_y = diag.coriolis_term_v
+
+    @. cor_x =  h_in_u * grid.f_u * v_in_u
+    @. cor_y = -h_in_v * grid.f_v * u_in_v
+
+    @. rhs_m = rhs_m + cor_x
+    @. rhs_n = rhs_n + cor_y
+
+    # ========================================================
+    # 4. Advection Terms
+    # ========================================================
+    adv_m = diag.advec_term_u
+    adv_n = diag.advec_term_v
+
+    @cuda threads=threads2 blocks=blocks2 k_calc_flux_m_for_ucell!(
+        adv_m,               # zonal-momentum tendency at u-cells
+        m, n,                # m = h u (UGRID), n = h v (VGRID)
+        h,
+        grid.dx_face_u, grid.dy_face_u,
+        grid.dArea_u,
+        Nx, Ny,
+        params.g,
+        hmin,
+    )
+
+    @cuda threads=threads2 blocks=blocks2 k_calc_flux_n_for_vcell!(
+        adv_n,               # meridional-momentum tendency at v-cells
+        m, n,
+        h,
+        grid.dx_face_v, grid.dy_face_v,
+        grid.dArea_v,
+        Nx, Ny,
+        params.g,
+        hmin,
+    )
+
+    curv_x = diag.advx_curv
+    curv_y = diag.advy_curv
+
+    lat_u_2d = grid.lat_u_2d
+    lat_v_2d = grid.lat_v_2d
+
+    @. curv_x =  h_in_u * u * v_in_u * tan(lat_u_2d * deg2rad) / params.earthRadius
+    @. curv_y = -h_in_v * u_in_v^2 * tan(lat_v_2d * deg2rad) / params.earthRadius
+
+    @. rhs_m = rhs_m + adv_m + curv_x
+    @. rhs_n = rhs_n + adv_n + curv_y
+
+    ##########################################################
+    #                  MASS CONSERVATION
+    ##########################################################
+    @cuda threads=threads2 blocks=blocks2 k_calc_WENOZ_flux2d!(
+        rhs_h,
+        h,
+        u, v,
+        grid.dx_face_h, grid.dy_face_h,
+        grid.dArea_h,
+        Nx, Ny,
+        HGRID,
     )
 
     return nothing
 end
 
 
-# ============================================================
-# Public API: baroclinic steps
-# ============================================================
-
-"""
-    step_baroclinic_layer!(
-        state::State,
-        grid::Grid,
-        p::Params,
-        threads1::Int,
-        blocks1::Int,
-        threads2::NTuple{2,Int},
-        blocks2::NTuple{2,Int};
-        layer::Int = 1,
-    )
-
-Advance a **single baroclinic layer** (1 or 2) by one baroclinic time step
-`p.dt` using RK4 for non-Coriolis terms, semi-implicit Coriolis, and
-weak Shapiro filtering on thickness.
-"""
-function step_baroclinic_layer!(
-    state::State,
+function predictor_baroclinic!(
+    prog::Prognostic,
+    hist::History,
+    intm::Intermediate,
+    temp::Temporary,
+    intp::Interpolated,
+    forc::Forcing,
+    diag::Diagnostic,
     grid::Grid,
-    p::Params,
+    params::Params,
     threads1::Int,
     blocks1::Int,
     threads2::NTuple{2,Int},
-    blocks2::NTuple{2,Int};
-    layer::Int = 1,
-    mode_split::Bool = true,
+    blocks2::NTuple{2,Int},
+    step::Int,
 )
-    dt = FT(p.dt)
+    dt = FT(params.dt)
 
-    rk4_step_baroclinic_layer_once!(
-        state,
-        grid,
-        p,
-        dt,
-        layer;
-        threads1=threads1,
-        blocks1=blocks1,
-        threads2=threads2,
-        blocks2=blocks2,
-        mode_split,
+    # Prognostic aliases at time n
+    m = prog.m
+    n = prog.n
+    h = prog.h
+
+    m_star = intm.m_star
+    n_star = intm.n_star
+    h_star = intm.h_star
+
+    rhs_m_tm0 = hist.rhs_m_tm0
+    rhs_n_tm0 = hist.rhs_n_tm0
+    rhs_h_tm0 = hist.rhs_h_tm0
+
+    rhs_m_tm1 = hist.rhs_m_tm1
+    rhs_n_tm1 = hist.rhs_n_tm1
+    rhs_h_tm1 = hist.rhs_h_tm1
+
+    rhs_m_tm2 = hist.rhs_m_tm2
+    rhs_n_tm2 = hist.rhs_n_tm2
+    rhs_h_tm2 = hist.rhs_h_tm2
+
+    # Compute RHS at time n
+    compute_baroclinic_rhs!(
+        rhs_m_tm0,
+        rhs_n_tm0,
+        rhs_h_tm0,
+        m, n, h,
+        diag, temp, intp,
+        grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
     )
+
+    # Bootstrap AB3 history on first baroclinic step
+    if step == 1
+        @. rhs_m_tm1 = rhs_m_tm0
+        @. rhs_n_tm1 = rhs_n_tm0
+        @. rhs_h_tm1 = rhs_h_tm0
+
+        @. rhs_m_tm2 = rhs_m_tm0
+        @. rhs_n_tm2 = rhs_n_tm0
+        @. rhs_h_tm2 = rhs_h_tm0
+    end
+
+    # AB3 coefficients
+    c0 = FT(23) / FT(12)
+    c1 = -FT(16) / FT(12)
+    c2 =  FT(5)  / FT(12)
+
+    # AB3 update to get q^{n+1,pre}
+    @. m_star = m + dt * (c0 * rhs_m_tm0 + c1 * rhs_m_tm1 + c2 * rhs_m_tm2)
+    @. n_star = n + dt * (c0 * rhs_n_tm0 + c1 * rhs_n_tm1 + c2 * rhs_n_tm2)
+    @. h_star = h + dt * (c0 * rhs_h_tm0 + c1 * rhs_h_tm1 + c2 * rhs_h_tm2)
+
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_u!(m_star, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(n_star, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(h_star, params.Nx, params.Ny)
 
     return nothing
 end
 
 
-"""
-    step_baroclinic!(
-        state::State,
-        grid::Grid,
-        p::Params;
-        threads1::Int,
-        blocks1::Int,
-        threads2::NTuple{2,Int},
-        blocks2::NTuple{2,Int},
-        mode_split::Bool = true,
+function corrector_baroclinic!(
+    prog::Prognostic,
+    hist::History,
+    intm::Intermediate,
+    temp::Temporary,
+    intp::Interpolated,
+    forc::Forcing,
+    diag::Diagnostic,
+    grid::Grid,
+    params::Params,
+    threads1::Int,
+    blocks1::Int,
+    threads2::NTuple{2,Int},
+    blocks2::NTuple{2,Int},
+)
+    dt = FT(params.dt)
+
+    m = prog.m
+    n = prog.n
+    h = prog.h
+
+    m_star = intm.m_star
+    n_star = intm.n_star
+    h_star = intm.h_star
+
+    rhs_m_tp1 = hist.rhs_m_tp1
+    rhs_n_tp1 = hist.rhs_n_tp1
+    rhs_h_tp1 = hist.rhs_h_tp1
+
+    rhs_m_tm0 = hist.rhs_m_tm0
+    rhs_n_tm0 = hist.rhs_n_tm0
+    rhs_h_tm0 = hist.rhs_h_tm0
+
+    rhs_m_tm1 = hist.rhs_m_tm1
+    rhs_n_tm1 = hist.rhs_n_tm1
+    rhs_h_tm1 = hist.rhs_h_tm1
+
+    rhs_m_tm2 = hist.rhs_m_tm2
+    rhs_n_tm2 = hist.rhs_n_tm2
+    rhs_h_tm2 = hist.rhs_h_tm2
+
+    # Recompute RHS at q^{n+1,pre}
+    compute_baroclinic_rhs!(
+        rhs_m_tp1,
+        rhs_n_tp1,
+        rhs_h_tp1,
+        m_star, n_star, h_star,
+        diag, temp, intp,
+        grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
     )
 
-Advance both baroclinic layers (1 then 2) by one baroclinic time step `p.dt`.
-"""
+    # AM3 coefficients
+    c0 = FT(5)  / FT(12)
+    c1 = FT(8)  / FT(12)
+    c2 = -FT(1) / FT(12)
+
+    # Temporary storage for q^{n+1}
+    m_tp1 = temp.temp_var_x2
+    n_tp1 = temp.temp_var_y2
+    h_tp1 = temp.temp_var_x3
+
+    # AM3 update to get q^{n+1}
+    @. m_tp1 = m + dt * (c0 * rhs_m_tp1 + c1 * rhs_m_tm0 + c2 * rhs_m_tm1)
+    @. n_tp1 = n + dt * (c0 * rhs_n_tp1 + c1 * rhs_n_tm0 + c2 * rhs_n_tm1)
+    @. h_tp1 = h + dt * (c0 * rhs_h_tp1 + c1 * rhs_h_tm0 + c2 * rhs_h_tm1)
+
+    # Shapiro filter on h
+    @cuda threads=threads2 blocks=blocks2 k_apply_shapiro_filter!(
+        h,
+        h_tp1,
+        params.smoothing_eps,
+        params.Nx, params.Ny,
+    )
+
+    # Update m, n to time n+1
+    @. m = m_tp1
+    @. n = n_tp1
+
+    # Rotate histories: (tm2 <- tm1), (tm1 <- tm0), (tm0 <- tp1)
+    @. rhs_m_tm2 = rhs_m_tm1
+    @. rhs_n_tm2 = rhs_n_tm1
+    @. rhs_h_tm2 = rhs_h_tm1
+
+    @. rhs_m_tm1 = rhs_m_tm0
+    @. rhs_n_tm1 = rhs_n_tm0
+    @. rhs_h_tm1 = rhs_h_tm0
+
+    @. rhs_m_tm0 = rhs_m_tp1
+    @. rhs_n_tm0 = rhs_n_tp1
+    @. rhs_h_tm0 = rhs_h_tp1
+
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_u!(m, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_v!(n, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(h, params.Nx, params.Ny)
+
+    return nothing
+end
+
+
 function step_baroclinic!(
     state::State,
     grid::Grid,
-    p::Params;
+    params::Params;
     threads1::Int,
     blocks1::Int,
     threads2::NTuple{2,Int},
     blocks2::NTuple{2,Int},
-    mode_split::Bool = true,
+    step::Int,
 )
-    step_baroclinic_layer!(
-        state, grid, p,
-        threads1, blocks1, threads2, blocks2;
-        layer=1, mode_split
+    prog1 = state.prog1
+    diag1 = state.diag1
+    hist1 = state.hist1
+    intm1 = state.intm1
+
+    prog2 = state.prog2
+    diag2 = state.diag2
+    hist2 = state.hist2
+    intm2 = state.intm2
+
+    temp = state.temp
+    intp = state.intp
+    forc = state.forc
+
+    Nx = Int(params.Nx)
+    Ny = Int(params.Ny)
+
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(prog1.h, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(prog2.h, params.Nx, params.Ny)
+
+    calc_pressure_all!(
+        diag1.pressure,
+        diag2.pressure,
+        prog1.h, prog2.h,
+        params.g, params.rho1,
+        params.rho2,
+        threads1, blocks1,
+        Nx, Ny,
     )
-    step_baroclinic_layer!(
-        state, grid, p,
-        threads1, blocks1, threads2, blocks2;
-        layer=2, mode_split
+
+    # Predictor (AB3): layer 1 & 2
+    predictor_baroclinic!(
+        prog1, hist1, intm1,
+        temp, intp, forc,
+        diag1, grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
+        step,
     )
+
+    predictor_baroclinic!(
+        prog2, hist2, intm2,
+        temp, intp, forc,
+        diag2, grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
+        step,
+    )
+
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(intm1.h_star, params.Nx, params.Ny)
+    @cuda threads=threads1 blocks=blocks1 k_apply_walls_h!(intm2.h_star, params.Nx, params.Ny)
+
+    calc_pressure_all!(
+        diag1.pressure,
+        diag2.pressure,
+        intm1.h_star, intm2.h_star,
+        params.g, params.rho1,
+        params.rho2,
+        threads1, blocks1,
+        Nx, Ny,
+    )
+
+    # Corrector (AM3): layer 1 & 2
+    corrector_baroclinic!(
+        prog1, hist1, intm1,
+        temp, intp, forc,
+        diag1, grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
+    )
+
+    corrector_baroclinic!(
+        prog2, hist2, intm2,
+        temp, intp, forc,
+        diag2, grid, params,
+        threads1, blocks1,
+        threads2, blocks2,
+    )
+
     return nothing
 end

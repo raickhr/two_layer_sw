@@ -1,40 +1,108 @@
+############################################################
+# advection_weno.jl
+#
+# True WENO-Z 5th-order flux-form advection on a 2D C-grid.
+#
+# This file provides:
+#
+#   - wenoZ5_left      : left-biased 5th-order reconstruction (Jiang & Shu 1996)
+#   - wenoZ5_right     : right-biased reconstruction (via stencil reversal)
+#   - wenoZ5_upwind    : velocity-based upwind selection of left/right states
+#   - wenoZ_flux1d     : 1D WENO-Z face flux for a single interface
+#   - k_calc_WENOZ_flux2d! :
+#         GPU kernel computing -∇·(u φ) on a 2D staggered C-grid
+#
+# Assumptions
+# -----------
+# - `FT` is the floating-point type (e.g., Float32 or Float64) defined
+#   at module scope.
+#
+# - Grid labels are Int16 constants defined elsewhere in the module:
+#       const HGRID::Int16 = ...
+#       const UGRID::Int16 = ...
+#       const VGRID::Int16 = ...
+#       const ZGRID::Int16 = ...
+#
+# - A device-safe `stencil` helper is available with signature
+#
+#       stencil(field,
+#               i::Int, j::Int,
+#               i_increment::Int, j_increment::Int,
+#               Nx::Int, Ny::Int,
+#               grid::Int16)
+#
+#   which:
+#       * interprets (i, j) as the base discrete index,
+#       * applies the (i_increment, j_increment) offset,
+#       * wraps/clamps in x,y according to `grid` (HGRID/UGRID/VGRID/ZGRID),
+#       * and returns `field[i_index, j_index]`.
+#
+# - CUDA is available (`using CUDA`) and kernels are launched via `@cuda`.
+#
+# Sign convention
+# ---------------
+# The kernel `k_calc_WENOZ_flux2d!` computes the conservative tendency
+#
+#       dφ[i,j] = ( -∇·(u φ) )_ij
+#
+# so that the caller typically updates with
+#
+#       φ_new .= φ_old .+ dt .* dφ
+#
+# to advance the field in time.
+############################################################
+
+
+# ============================================================
+# Grid helper: where φ, u_face, v_face live
+# ============================================================
+
 """
-advection_weno.jl
+    get_grid_centerType(gridCenter::Int16) -> (grid_φ, grid_u, grid_v)
 
-WENO-Z 5th order flux-form advection on a 2D C-grid.
+Return the grid-character tuple used by `stencil` for:
 
-This file provides:
+  - `grid_φ` : locations of the advected quantity φ,
+  - `grid_u` : locations of the zonal / x-face quantity (u_face, dy_face),
+  - `grid_v` : locations of the meridional / y-face quantity (v_face, dx_face).
 
-- `wenoZ5_left`   : left-biased 5th-order reconstruction (Jiang & Shu 1996)
-- `wenoZ5_right`  : right-biased reconstruction (using stencil reversal)
-- `wenoZ5_upwind` : velocity-based upwind selection of left/right states
-- `wenoZ_flux1d`  : 1D flux-form WENO-Z contribution for a single cell
-- `k_calc_WENOZ_flux2d!` : GPU kernel computing   -∇·(u φ)  on a 2D grid
-
-Assumptions
+Conventions
 -----------
-- `FT` is the floating-point type (e.g. Float32/Float64) defined at module scope.
-- `iper(i, Nx)` implements **periodic** wrap in x.
-- `clamp1(j, Ny)` implements clamping to `[1, Ny]` in y (solid walls).
-- `CUDA` is available (`using CUDA`) and kernels are launched via `@cuda`.
+- `HGRID` : cell centers / mass points
+- `UGRID` : u-points (east–west cell faces)
+- `VGRID` : v-points (north–south cell faces)
+- `ZGRID` : corner / ζ-points
 
-Sign convention
----------------
-`k_calc_WENOZ_flux2d!` returns
-
-    dφ[i,j] = ( -∇·(u φ) )_ij
-
-so that, in the caller, you typically do
-
-    φ_new = φ_old + dt * dφ
-
-for an advective update in conservative flux form.
+Typical choices:
+- `gridCenter = HGRID` (default use in most SW models):
+    φ on h, u_face & dy_face on u, v_face & dx_face on v
+- `gridCenter = UGRID`:
+    φ on u, u_face & dy_face on h, v_face & dx_face on z
+- `gridCenter = VGRID`:
+    φ on v, u_face & dy_face on z, v_face & dx_face on h
 """
+@inline function get_grid_centerType(gridCenter::Int16)::NTuple{3,Int16}
+    if gridCenter == HGRID
+        # φ on h, u_face/dy_face on u, v_face/dx_face on v
+        return (HGRID, UGRID, VGRID)
+    elseif gridCenter == UGRID
+        # φ on u, u_face/dy_face on h, v_face/dx_face on z
+        return (UGRID, HGRID, ZGRID)
+    elseif gridCenter == VGRID
+        # φ on v, u_face/dy_face on z, v_face/dx_face on h
+        return (VGRID, ZGRID, HGRID)
+    else
+        # Fallback: treat unknown types like HGRID
+        return (HGRID, UGRID, VGRID)
+    end
+end
 
-# ===========================
+
+# ============================================================
 # WENO-Z 5th order core
-# ===========================
+# ============================================================
 
+# Global smoothness epsilon (Borges et al. WENO-Z)
 const WENO_EPS = FT(1e-6)
 
 """
@@ -43,23 +111,26 @@ const WENO_EPS = FT(1e-6)
 5th-order **left-biased** WENO-Z reconstruction at interface `i+1/2`
 for flow to the right.
 
-Arguments correspond to cell-centered stencil values:
+The arguments correspond to cell-centered stencil values:
+
 - `φm2 = φ_{i-2}`
 - `φm1 = φ_{i-1}`
 - `φ0  = φ_i`
 - `φp1 = φ_{i+1}`
 - `φp2 = φ_{i+2}`
 """
-@inline function wenoZ5_left(φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT)::FT
-    # Linear weights (optimal)
+@inline function wenoZ5_left(
+    φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT
+)::FT
+    # Linear (optimal) weights
     d0 = FT(0.1)
     d1 = FT(0.6)
     d2 = FT(0.3)
 
-    # Candidate reconstructions (Jiang & Shu 1996)
-    q0 = ( FT(2)*φm2 - FT(7)*φm1 + FT(11)*φ0 ) / FT(6)   # stencil {i-2,i-1,i}
-    q1 = ( -φm1 + FT(5)*φ0 + FT(2)*φp1 ) / FT(6)        # stencil {i-1,i,i+1}
-    q2 = ( FT(2)*φ0 + FT(5)*φp1 - φp2 ) / FT(6)         # stencil {i,i+1,i+2}
+    # Candidate polynomials (Jiang & Shu 1996)
+    q0 = ( FT(2)*φm2 - FT(7)*φm1 + FT(11)*φ0 ) / FT(6)  # {i-2, i-1, i}
+    q1 = ( -φm1 + FT(5)*φ0 + FT(2)*φp1 ) / FT(6)       # {i-1, i, i+1}
+    q2 = ( FT(2)*φ0 + FT(5)*φp1 - φp2 ) / FT(6)        # {i, i+1, i+2}
 
     # Smoothness indicators β_k
     β0 = ( FT(13)/FT(12) * (φm2 - FT(2)*φm1 + φ0)^2 +
@@ -71,10 +142,10 @@ Arguments correspond to cell-centered stencil values:
     β2 = ( FT(13)/FT(12) * (φ0 - FT(2)*φp1 + φp2)^2 +
            FT(1)/FT(4)  * (FT(3)*φ0 - FT(4)*φp1 + φp2)^2 )
 
-    # Borges et al. (WENO-Z) global smoothness indicator
+    # Global smoothness indicator τ_5 (Borges et al. 2008, WENO-Z)
     τ5 = abs(β0 - β2)
 
-    # Nonlinear weights α_k (p = 2 is standard)
+    # Nonlinear weights α_k, p = 2 is standard
     pz = FT(2)
     α0 = d0 * (FT(1) + (τ5 / (β0 + WENO_EPS))^pz)
     α1 = d1 * (FT(1) + (τ5 / (β1 + WENO_EPS))^pz)
@@ -97,7 +168,9 @@ for flow to the left.
 Implemented by calling `wenoZ5_left` on the reversed stencil
 `{φp2, φp1, φ0, φm1, φm2}`.
 """
-@inline function wenoZ5_right(φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT)::FT
+@inline function wenoZ5_right(
+    φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT
+)::FT
     # Right state at i+1/2 for left-going waves is equivalent to
     # left state at i+1/2 for the reversed stencil.
     return wenoZ5_left(φp2, φp1, φ0, φm1, φm2)
@@ -108,11 +181,13 @@ end
 
 Velocity-based upwind selection:
 
-- If `vel ≥ 0`, returns `wenoZ5_left(...)`
-- Otherwise, returns `wenoZ5_right(...)`
+- If `vel ≥ 0`, returns `wenoZ5_left(...)`.
+- If `vel < 0`, returns `wenoZ5_right(...)`.
 """
-@inline function wenoZ5_upwind(φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT,
-                               vel::FT)::FT
+@inline function wenoZ5_upwind(
+    φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT,
+    vel::FT,
+)::FT
     if vel ≥ FT(0)
         return wenoZ5_left(φm2, φm1, φ0, φp1, φp2)   # flow to the right
     else
@@ -122,153 +197,189 @@ end
 
 """
     wenoZ_flux1d(φm2, φm1, φ0, φp1, φp2,
-                 u_west, u_east,
-                 L_west, L_east,
-                 A) -> FT
+                 normal_vel, L_face) -> FT
 
-Compute **1D flux-form WENO-Z contribution** for a single cell:
+Compute the **WENO-Z flux at a single face** (true 5th order).
 
-Returns
--------
-`dφ_i = (F_{i-1/2} - F_{i+1/2}) / A`
+Given a 5-point stencil `{φm2, φm1, φ0, φp1, φp2}` around the interface,
+and face-normal velocity `normal_vel` and face length `L_face`, this function:
 
-where
-- Interface states are reconstructed with WENO-Z (upwinded)
-- Fluxes are `F = u * φ * L`, with:
-    * `u_west`, `u_east` : velocities at west/east faces
-    * `L_west`, `L_east` : face lengths (dy or dx)
-- `A` is the cell area
+1. Reconstructs the interface state `φ_face` using 5th-order WENO-Z
+   with upwind direction determined by `normal_vel`.
+2. Returns the physical flux
+
+       F_face = normal_vel * φ_face * L_face
 """
 @inline function wenoZ_flux1d(
     φm2::FT, φm1::FT, φ0::FT, φp1::FT, φp2::FT,
-    u_west::FT, u_east::FT,
-    L_west::FT, L_east::FT,
-    A::FT)::FT
-
-    # Interface states
-    φ_west  = wenoZ5_upwind(φm2, φm1, φ0, φp1, φp2, u_west)
-    φ_east  = wenoZ5_upwind(φm2, φm1, φ0, φp1, φp2, u_east)
-
-    # Physical fluxes F = u * φ * L (scalar advection)
-    F_west  = u_west * φ_west  * L_west
-    F_east  = u_east * φ_east  * L_east
-
-    # (F_{i-1/2} - F_{i+1/2}) / A
-    return (F_west - F_east) / A
+    normal_vel::FT, L_face::FT,
+)::FT
+    φ_face = wenoZ5_upwind(φm2, φm1, φ0, φp1, φp2, normal_vel)
+    return normal_vel * φ_face * L_face
 end
 
+
+# ============================================================
+# 2D WENO-Z flux-form advection kernel
+# ============================================================
 
 """
     k_calc_WENOZ_flux2d!(dφ, φ, u_face, v_face,
                          dx_face, dy_face, dArea,
-                         Nx, Ny)
+                         Nx, Ny, gridCenter)
 
-GPU kernel: 2D WENO-Z 5th-order advection in conservative flux form.
+GPU kernel: 2D WENO-Z advection in conservative flux form.
 
 Computes, for each cell (i,j),
+
     dφ[i,j] = ( -∇·(u φ) )_ij
+
+using **true 5th-order WENO-Z** at each face, with separate
+5-point stencils centered on each interface.
 
 Inputs
 ------
-- `φ      :: CuArray{FT,2}` : cell-centered scalar on h-cells
-- `u_face :: CuArray{FT,2}` : face-normal velocity on EAST faces of h-cells
-- `v_face :: CuArray{FT,2}` : face-normal velocity on NORTH faces of h-cells
-- `dx_face, dy_face`       : face lengths (same staggering as `u_face`, `v_face`)
-- `dArea`                  : cell area at h-points
-- `Nx, Ny`                 : horizontal grid size
+- `dφ      :: CuArray{FT,2}` :
+      output tendency, same grid as `φ`.
+
+- `φ       :: CuArray{FT,2}` :
+      scalar to be advected, located on the grid indicated by `gridCenter`
+      (one of HGRID, UGRID, VGRID).
+
+- `u_face  :: CuArray{FT,2}` :
+      face-normal velocity on x-faces (east/west of the φ-cells), residing
+      on the grid returned as `grid_u` by `get_grid_centerType(gridCenter)`.
+
+- `v_face  :: CuArray{FT,2}` :
+      face-normal velocity on y-faces (north/south of the φ-cells), residing
+      on the grid returned as `grid_v` by `get_grid_centerType(gridCenter)`.
+
+- `dx_face :: CuArray{FT,2}` :
+      face length in x-direction (used with v_face on `grid_v`).
+
+- `dy_face :: CuArray{FT,2}` :
+      face length in y-direction (used with u_face on `grid_u`).
+
+- `dArea   :: CuArray{FT,2}` :
+      control-volume area at φ-locations (grid `grid_φ`).
+
+- `Nx, Ny  :: Int` :
+      horizontal grid size (number of φ-cells in x and y).
+
+- `gridCenter :: Int16` :
+      grid label where φ lives:
+          HGRID → φ on h, u_face on u, v_face on v
+          UGRID → φ on u, u_face on h, v_face on z
+          VGRID → φ on v, u_face on z, v_face on h
 
 Boundary handling
 -----------------
-- Periodic in x via `iper`
-- Clamped in y via `clamp1`, consistent with solid-wall north/south boundaries
+All boundary and staggering details are handled via `stencil(...)`,
+which typically wraps periodically in x and clamps in y according to
+your grid conventions.
 
 Usage pattern
 -------------
-The kernel fills `dφ` with the **spatial** tendency:
+The kernel fills `dφ` with the spatial tendency:
 
-    dφ = ( -∇·(u φ) )
+    dφ .= ( -∇·(u φ) )
 
-Caller should update:
+Caller then usually does:
 
     φ .= φ .+ dt .* dφ
 """
 function k_calc_WENOZ_flux2d!(
     dφ,                 # (Nx,Ny) output: ( -∇·(u φ) )
-    φ,                  # (Nx,Ny) cell-centered scalar
-    u_face, v_face,     # (Nx,Ny) face-normal velocities:
-                        #   u_face: on east/west faces of h-cell
-                        #   v_face: on north/south faces of h-cell
+    φ,                  # (Nx,Ny) scalar on gridCenter
+    u_face, v_face,     # (Nx,Ny) face-normal velocities (zonal, meridional)
     dx_face, dy_face,   # (Nx,Ny) face lengths
-    dArea,              # (Nx,Ny) cell area
-    Nx::Int, Ny::Int)
-    """
-    WENO-Z 5th order 2D advection kernel in flux-form.
-
-    Assumes:
-    - Periodic in x (using iper) and clamped in y (using clamp1)
-    - u_face[i,j]: velocity on EAST face of cell (i-1,j) / WEST of cell (i,j)
-    - v_face[i,j]: velocity on NORTH face of cell (i,j-1) / SOUTH of cell (i,j)
-    """
+    dArea,              # (Nx,Ny) control-volume area
+    Nx::Int, Ny::Int,
+    gridCenter::Int16,
+)
+    # Decide grid chars once per thread (φ-grid, u-grid, v-grid)
+    grid_φ, grid_u, grid_v = get_grid_centerType(gridCenter)
 
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
     if i <= Nx && j <= Ny
-        # indices for stencil
-        im2 = iper(i-2, Nx)
-        im1 = iper(i-1, Nx)
-        ip1 = iper(i+1, Nx)
-        ip2 = iper(i+2, Nx)
-
-        jm2 = clamp1(j-2, Ny)
-        jm1 = clamp1(j-1, Ny)
-        jp1 = clamp1(j+1, Ny)
-        jp2 = clamp1(j+2, Ny)
-
-        A = dArea[i,j]
+        # Local control-volume area
+        A = dArea[i, j]
 
         # -------------------------
         # X-direction contribution
         # -------------------------
         # u at faces:
-        #   east face of cell i:  u_face[i,  j]
-        #   west face of cell i:  u_face[im1,j]
-        u_east = u_face[i,  j]
-        u_west = u_face[im1,j]
+        #   east face of cell (i,j):  u_face[i,  j]
+        #   west face of cell (i,j):  u_face[i-1,j]
+        u_east = stencil(u_face, i, j,   0, 0, Nx, Ny, grid_u)
+        u_west = stencil(u_face, i, j,  -1, 0, Nx, Ny, grid_u)
 
         # face lengths in y-direction (height of face)
-        L_east = dy_face[i,  j]
-        L_west = dy_face[im1,j]
+        L_east = stencil(dy_face, i, j,   0, 0, Nx, Ny, GRID0)
+        L_west = stencil(dy_face, i, j,  -1, 0, Nx, Ny, GRID0)
 
-        Xcontrib = wenoZ_flux1d(
-            φ[im2, j], φ[im1, j], φ[i, j], φ[ip1, j], φ[ip2, j],
-            u_west, u_east,
-            L_west, L_east,
-            A
+        # East face (i+1/2): stencil {φ_{i-2},...,φ_{i+2}}
+        F_east = wenoZ_flux1d(
+            stencil(φ, i, j,  -2, 0, Nx, Ny, grid_φ),  # φ_{i-2}
+            stencil(φ, i, j,  -1, 0, Nx, Ny, grid_φ),  # φ_{i-1}
+            stencil(φ, i, j,   0, 0, Nx, Ny, grid_φ),  # φ_i
+            stencil(φ, i, j,  +1, 0, Nx, Ny, grid_φ),  # φ_{i+1}
+            stencil(φ, i, j,  +2, 0, Nx, Ny, grid_φ),  # φ_{i+2}
+            u_east, L_east,
         )
+
+        # West face (i-1/2): stencil {φ_{i-3},...,φ_{i+1}}
+        F_west = wenoZ_flux1d(
+            stencil(φ, i, j,  -3, 0, Nx, Ny, grid_φ),  # φ_{i-3}
+            stencil(φ, i, j,  -2, 0, Nx, Ny, grid_φ),  # φ_{i-2}
+            stencil(φ, i, j,  -1, 0, Nx, Ny, grid_φ),  # φ_{i-1}
+            stencil(φ, i, j,   0, 0, Nx, Ny, grid_φ),  # φ_i
+            stencil(φ, i, j,  +1, 0, Nx, Ny, grid_φ),  # φ_{i+1}
+            u_west, L_west,
+        )
+
+        Xcontrib = (F_west - F_east) / A
 
         # -------------------------
         # Y-direction contribution
         # -------------------------
         # v at faces:
-        #   north face of cell i: v_face[i,  j]
-        #   south face of cell i: v_face[i,  jm1]
-        v_north = v_face[i,  j]
-        v_south = v_face[i,  jm1]
+        #   north face of cell (i,j): v_face[i,  j]
+        #   south face of cell (i,j): v_face[i,  j-1]
+        v_north = stencil(v_face, i, j,  0,  0, Nx, Ny, grid_v)
+        v_south = stencil(v_face, i, j,  0, -1, Nx, Ny, grid_v)
 
         # face lengths in x-direction (width of face)
-        L_north = dx_face[i,  j]
-        L_south = dx_face[i,  jm1]
+        L_north = stencil(dx_face, i, j,  0,  0, Nx, Ny, GRID0)
+        L_south = stencil(dx_face, i, j,  0, -1, Nx, Ny, GRID0)
 
-        Ycontrib = wenoZ_flux1d(
-            φ[i, jm2], φ[i, jm1], φ[i, j], φ[i, jp1], φ[i, jp2],
-            v_south, v_north,
-            L_south, L_north,
-            A
+        # North face (j+1/2): stencil {φ_{j-2},...,φ_{j+2}}
+        F_north = wenoZ_flux1d(
+            stencil(φ, i, j,  0, -2, Nx, Ny, grid_φ),  # φ_{j-2}
+            stencil(φ, i, j,  0, -1, Nx, Ny, grid_φ),  # φ_{j-1}
+            stencil(φ, i, j,  0,  0, Nx, Ny, grid_φ),  # φ_j
+            stencil(φ, i, j,  0, +1, Nx, Ny, grid_φ),  # φ_{j+1}
+            stencil(φ, i, j,  0, +2, Nx, Ny, grid_φ),  # φ_{j+2}
+            v_north, L_north,
         )
 
+        # South face (j-1/2): stencil {φ_{j-3},...,φ_{j+1}}
+        F_south = wenoZ_flux1d(
+            stencil(φ, i, j,  0, -3, Nx, Ny, grid_φ),  # φ_{j-3}
+            stencil(φ, i, j,  0, -2, Nx, Ny, grid_φ),  # φ_{j-2}
+            stencil(φ, i, j,  0, -1, Nx, Ny, grid_φ),  # φ_{j-1}
+            stencil(φ, i, j,  0,  0, Nx, Ny, grid_φ),  # φ_j
+            stencil(φ, i, j,  0, +1, Nx, Ny, grid_φ),  # φ_{j+1}
+            v_south, L_south,
+        )
+
+        Ycontrib = (F_south - F_north) / A
+
         # Total contribution: ( -∇·(u φ) )
-        dφ[i,j] = Xcontrib + Ycontrib
+        dφ[i, j] = Xcontrib + Ycontrib
     end
+
     return
 end
