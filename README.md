@@ -141,5 +141,5 @@ View the GIF below:
 
 View the movie below:
 
+![η animation](assets/zeta_movie.gif)
 
-https://github.com/user-attachments/assets/a96b10a5-ec47-4ed6-bedf-e799301663d7
