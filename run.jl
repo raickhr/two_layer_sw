@@ -87,17 +87,17 @@ if abspath(PROGRAM_FILE) == @__FILE__
         # ------------------------
         Nx   = 256,
         Ny   = 256,
-        lon1 = -190.0,
-        lat1 = 55.5,
-        lon2 = -175.0,
-        lat2 = 63.0,
+        lon1 = -193.75, #-190;
+        lat1 = 53.625, #55.5;
+        lon2 = -171.25, #-175;
+        lat2 = 64.875, #63;
 
         # ------------------------
         # Time stepping
         # ------------------------
-        dt       = 5,          # baroclinic time step (s)
+        dt       = 6,          # baroclinic time step (s)
         M        = 0,           # barotropic subcycles
-        end_time = 365*24*3600.0,   # 12 days
+        end_time = 240*24*3600.0,   # 12 days
 
         # ------------------------
         # Layer properties

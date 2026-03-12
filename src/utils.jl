@@ -570,7 +570,7 @@ function calculate_leith_viscosity!(
     threads2::NTuple{2,Int},
     blocks2::NTuple{2,Int},
     Nx::Int, Ny::Int, 
-    C::FT = FT(0.8),
+    C::FT = FT(1),
 )
     ##############################
     # ∇ζ on UGRID / VGRID
