@@ -34,14 +34,14 @@ function run_twoLayer_SW(; kwargs...)
     prog_bar = Progress(nsteps; dt = 0.0, desc = "Time stepping")
 
     # Initial condition (Kelvin wave bulb)
-    # initialize_surface_bulb!(state, p, 
-    #                          η0   = FT(0.1),
-    #                          R    = FT(500e3),
-    #                          lon0 = FT(p.lon1 + p.Nx/FT(4.0) * p.dlon),
-    #                          lat0 = FT(p.lat1 + p.Ny/FT(2.0) * p.dlat))
+    initialize_surface_bulb!(state, p, 
+                             η0   = FT(0.15),
+                             R    = FT(1000e3),
+                             lon0 = FT(p.lon1 + p.Nx/FT(4.0) * p.dlon),
+                             lat0 = FT(p.lat1 + p.Ny/FT(2.0) * p.dlat))
 
     # Inital baroclinic jet 
-    initialize_baroclinic_tanh_jet!(state, p, Δξ = FT(400.0), L = FT(100.0e3), noise_amp = FT(0.05))
+    # initialize_baroclinic_tanh_jet!(state, p, Δξ = FT(400.0), L = FT(100.0e3), noise_amp = FT(0.05))
 
     # 4. Main loop
     current_time = 0.0

@@ -87,17 +87,17 @@ if abspath(PROGRAM_FILE) == @__FILE__
         # ------------------------
         Nx   = 256,
         Ny   = 256,
-        lon1 = -193.75, #-190;
-        lat1 = 53.625, #55.5;
-        lon2 = -171.25, #-175;
-        lat2 = 64.875, #63;
+        lon1 = -190.0,
+        lat1 = 55.5,
+        lon2 = -175.0,
+        lat2 = 63.0,
 
         # ------------------------
         # Time stepping
         # ------------------------
-        dt       = 6,          # baroclinic time step (s)
+        dt       = 1,          # baroclinic time step (s)
         M        = 0,           # barotropic subcycles
-        end_time = 150*24*3600.0,   # 12 days
+        end_time = 60*24*3600.0,   # 12 days
 
         # ------------------------
         # Layer properties
@@ -105,7 +105,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
         H1   = 500.0,
         H2   = 1500.0,
         rho1 = 1025.0,
-        rho2 = 1027.0,
+        rho2 = 1026.0,
 
         # ------------------------
         # Forcing parameters
@@ -120,14 +120,14 @@ if abspath(PROGRAM_FILE) == @__FILE__
         # Dissipation / smoothing
         # ------------------------
         nu            = 0.1, #200,
-        smoothing_eps = 0.005,
+        smoothing_eps = 0.001,
 
         # ------------------------
         # Output
         # ------------------------
-        save_interval = 24*3600, # 1 hours
+        save_interval = 3*3600, # 1 hours
         out_netcdf    = "two_layer_SW_bc_inst.nc",
-        diag_netcdf   = "diag_bc_inst.nc",
+        diag_netcdf   = "diag.nc", #"diag.nc",
     )
 
 end
