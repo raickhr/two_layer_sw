@@ -128,13 +128,16 @@ Exit Julia and run the model from the terminal:
 julia run.jl
 ```
 
-The default configuration runs a 12-day Kelvin/Rossby wave test case at the equator and writes output to a NetCDF file (e.g. two_layer_SW.nc), which can be analyzed using Julia, Python (xarray), or MATLAB. Initial condtions is a SSH of gaussian bulb of radius 1000 km. The interface between the two layers does not have perturbations
+The default configuration runs a 60-day Kelvin/Rossby wave test case at the equator and writes output to a NetCDF file (e.g., two_layer_SW.nc), which can be analyzed using Julia, Python (xarray), or MATLAB. Initial conditions are an SSH of a Gaussian bulb of radius 1000 km, 0.15m height, and an interface depression of 50m.
 
 ## 🎥 Model Animation
 
 View the GIF below:
-
 ![η animation](assets/eta_movie.gif)
+Fig: SSH animation
+
+![η animation](assets/xi_movie.gif)
+Fig: Interface anomaly animation
 
 
 ## 🎥 Model Animation Baroclinic Instability Case
