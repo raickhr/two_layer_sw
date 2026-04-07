@@ -132,12 +132,16 @@ The default configuration runs a 60-day Kelvin/Rossby wave test case at the equa
 
 ## 🎥 Model Animation
 
-View the GIF below:
-![η animation](assets/eta_movie.gif)
-Fig: SSH animation
-
-![η animation](assets/xi_movie.gif)
-Fig: Interface anomaly animation
+<table>
+  <tr>
+    <td><img src="assets/eta_movie.gif" width="100%"></td>
+    <td><img src="assets/xi_movie.gif" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">Fig: SSH animation</td>
+    <td align="center">Fig: Interface anomaly animation</td>
+  </tr>
+</table>
 
 
 ## 🎥 Model Animation Baroclinic Instability Case
